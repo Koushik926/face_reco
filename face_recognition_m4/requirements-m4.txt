@@ -1,0 +1,13 @@
+# Mac M4 / Apple Silicon friendly requirements
+# Recommended to install Python via miniforge (see README.md for steps)
+torch>=2.2.0
+torchvision>=0.16.0
+facenet-pytorch>=2.5.2
+opencv-python-headless>=4.7.0
+numpy>=1.25.0
+Pillow>=10.0.0
+scikit-learn>=1.2.2
+tqdm>=4.65.0
+
+# Note: On macOS you may prefer installing opencv via brew and use the system site-packages
+# If using conda/miniforge prefer `conda install -c conda-forge opencv` to get wheels that work well.
