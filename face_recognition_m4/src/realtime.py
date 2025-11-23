@@ -184,7 +184,9 @@ def main():
                         if now - last >= args.greet_interval:
                             # non-blocking speak
                             try:
-                                text = f"Hello {label}. Welcome."
+                                # Expand abbreviations for better TTS pronunciation
+                                spoken_label = label.replace("Dr.", "Doctor").replace("Mr.", "Mister").replace("Ms.", "Miss").replace("Mrs.", "Missus")
+                                text = f"Hello {spoken_label}. Welcome."
                                 # debug print to confirm greeting trigger
                                 print(f"Greeting triggered for {label} (score={sc_val:.3f}) -> say: {text}")
                                 try:
