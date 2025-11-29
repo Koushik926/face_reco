@@ -23,6 +23,7 @@ from embedder import Embedder
 from recognizer import Recognizer
 from tracker import SimpleTracker, iou
 from utils import draw_box_label, resize_keep_aspect, box_scale_back
+from liveness import LivenessDetector
 
 
 def get_device(prefer: str = None):
@@ -50,11 +51,21 @@ def main():
     parser.add_argument('--detect-every', type=int, default=3, help='Run MTCNN every N frames')
     parser.add_argument('--embedder', choices=['resnet', 'mobileface'], default='resnet', help='Embedding model to use')
     parser.add_argument('--pad-mult', type=int, default=64, help='Padding multiple used by detector when running on MPS (higher may avoid MPS adaptive pool errors)')
-    parser.add_argument('--smoothing-alpha', type=float, default=0.6, help='Tracker smoothing alpha (0..1) where higher=more responsive')
+    parser.add_argument('--smoothing-alpha', type=float, default=0.4, help='Tracker smoothing alpha (0..1) where lower=more stable')
+    parser.add_argument('--max-missed', type=int, default=18, help='Max frames to keep a track without detection (higher=less blinking)')
     parser.add_argument('--log-csv', default=os.path.join(os.path.dirname(__file__), '..', 'recognitions.csv'))
     parser.add_argument('--greet', action='store_true', help='Enable TTS greeting for recognized people (macOS say)')
+    parser.add_argument('--greet-unknown', action='store_true', help='Also greet unknown people with a generic message')
     parser.add_argument('--greet-interval', type=float, default=6.0, help='Minimum seconds between greetings for the same person')
     parser.add_argument('--greet-threshold', type=float, default=0.6, help='Minimum recognition score to trigger greeting')
+    parser.add_argument('--min-live-frames', type=int, default=5, help='Minimum consecutive hits before considering a face live (anti-spoof heuristic)')
+    parser.add_argument('--stable-k', type=int, default=3, help='Frames required to stabilize identity (majority vote)')
+    parser.add_argument('--stable-min-score', type=float, default=0.65, help='Minimum score to count toward identity stabilization')
+    parser.add_argument('--require-liveness', action='store_true', help='Enable landmark-based liveness detection (blink/motion) to prevent 2D photo spoofing')
+    parser.add_argument('--liveness-motion-threshold', type=float, default=25.0, help='Minimum motion variance for liveness (higher=stricter)')
+    parser.add_argument('--liveness-min-motion-frames', type=int, default=10, help='Minimum frames with motion required for liveness')
+    parser.add_argument('--liveness-texture-threshold', type=float, default=20.0, help='Minimum texture variance for liveness (screens/photos have lower values)')
+    parser.add_argument('--debug-liveness', action='store_true', help='Print liveness detection values for debugging')
     args = parser.parse_args()
 
     device = get_device(args.device)
@@ -66,7 +77,12 @@ def main():
     recognizer = Recognizer(db, threshold=args.threshold)
     detector = FaceDetector(device=device, detection_device=det_device, pad_mult=args.pad_mult)
     embedder = Embedder(model_name=args.embedder, device=device)
-    tracker = SimpleTracker(smoothing_alpha=args.smoothing_alpha)
+    tracker = SimpleTracker(smoothing_alpha=args.smoothing_alpha, max_missed=args.max_missed, stable_k=args.stable_k, stable_min_score=args.stable_min_score)
+    liveness_detector = LivenessDetector(
+        motion_threshold=args.liveness_motion_threshold,
+        min_motion_frames=args.liveness_min_motion_frames,
+        texture_threshold=args.liveness_texture_threshold
+    ) if args.require_liveness else None
 
     cap = cv2.VideoCapture(args.cam)
     if not cap.isOpened():
@@ -96,9 +112,10 @@ def main():
             labels = []
             boxes_out = []
             scores = []
+            landmarks_out = []
 
             if frame_count % args.detect_every == 0:
-                boxes, probs, faces = detector.detect(small)
+                boxes, probs, faces, landmarks = detector.detect(small)
                 if boxes:
                     # If detector returned aligned face tensors, use them (fast path)
                     if faces is not None and len(faces) > 0:
@@ -137,11 +154,18 @@ def main():
                             matches = []
 
                     # boxes correspond to small scale, scale back to original frame
-                    for b, (name, score) in zip(boxes, matches):
+                    for i, (b, (name, score)) in enumerate(zip(boxes, matches)):
                         b_orig = box_scale_back(b, scale)
                         boxes_out.append(b_orig)
                         labels.append(name)
                         scores.append(score)
+                        # scale landmarks back to original frame
+                        if landmarks is not None and i < len(landmarks):
+                            lm = np.array(landmarks[i])
+                            lm_scaled = lm / scale
+                            landmarks_out.append(lm_scaled)
+                        else:
+                            landmarks_out.append(None)
             else:
                 # no detection; use previously tracked boxes
                 boxes = []
@@ -149,12 +173,51 @@ def main():
             # tracker: update with boxes_out (in original frame coords)
             tracked = tracker.update(boxes_out, labels=labels, scores=scores)
 
+            # Prioritize nearest (largest box area); draw in order
+            def area(b):
+                return max(0, (b[2] - b[0])) * max(0, (b[3] - b[1]))
+            sorted_tracked = sorted(tracked.items(), key=lambda kv: area(kv[1]), reverse=True)
+
             # Draw tracked boxes
-            for tid, box in tracked.items():
+            for idx_sort, (tid, box) in enumerate(sorted_tracked):
                 # prefer track's last-known label (set in tracker.update); fallback to IoU matching
                 tr = tracker.tracks.get(tid, {})
-                label = tr.get('label', 'Unknown')
-                score = tr.get('score', None)
+                # use stabilized identity if available
+                label = tr.get('stable_label', tr.get('label', 'Unknown'))
+                score = tr.get('stable_score', tr.get('score', None))
+                hits = int(tr.get('hits', 0))
+                
+                # Only the nearest person (idx_sort == 0) gets greeted
+                is_nearest = (idx_sort == 0)
+                
+                # Liveness check if enabled
+                liveness_ok = True
+                if liveness_detector is not None:
+                    # Find matching landmark for this track
+                    lm_for_track = None
+                    face_region = None
+                    for i, (b, lm) in enumerate(zip(boxes_out, landmarks_out)):
+                        if iou(box, b) > 0.3:
+                            lm_for_track = lm
+                            # Extract face region for texture analysis
+                            x1, y1, x2, y2 = [int(c) for c in box]
+                            x1 = max(0, x1)
+                            y1 = max(0, y1)
+                            x2 = min(frame.shape[1], x2)
+                            y2 = min(frame.shape[0], y2)
+                            if x2 > x1 and y2 > y1:
+                                face_region = frame[y1:y2, x1:x2]
+                            break
+                    if lm_for_track is not None:
+                        liveness_result = liveness_detector.update(tid, lm_for_track, box, face_region)
+                        liveness_ok = liveness_result['is_live']
+                        # Debug logging
+                        if args.debug_liveness:
+                            print(f"[Liveness] {label}#{tid}: motion={liveness_result['motion_frames']}/{args.liveness_min_motion_frames}, "
+                                  f"texture={liveness_result.get('texture_variance', 0):.1f} (min={args.liveness_texture_threshold}), "
+                                  f"live={liveness_ok}")
+                    else:
+                        liveness_ok = False  # no landmarks means no liveness confirmation
                 if label == 'Unknown' and boxes_out:
                     # use IoU to find best matching detection and assign label
                     best_iou = 0.0
@@ -170,48 +233,76 @@ def main():
                         # store back into tracker
                         tr['label'] = label
                         tr['score'] = score
+                        # also push to history for stabilization
+                        hist = tr.get('history')
+                        if hist is not None:
+                            try:
+                                scv = float(score) if score is not None else None
+                            except Exception:
+                                scv = None
+                            hist.append((label, scv))
                 draw_box_label(frame, box, f"{label}#{tid}", score)
 
                 # TTS greeting (macOS `say`) — speak once per person per interval
-                if args.greet and label != 'Unknown' and score is not None:
-                    try:
-                        sc_val = float(score)
-                    except Exception:
-                        sc_val = 0.0
-                    if sc_val >= args.greet_threshold:
-                        now = time.time()
-                        last = last_greet_time.get(label, 0.0)
-                        if now - last >= args.greet_interval:
-                            # non-blocking speak
-                            try:
-                                # Expand abbreviations for better TTS pronunciation
-                                spoken_label = label.replace("Dr.", "Doctor").replace("Mr.", "Mister").replace("Ms.", "Miss").replace("Mrs.", "Missus")
-                                text = f"Hello {spoken_label}. Welcome."
-                                # debug print to confirm greeting trigger
-                                print(f"Greeting triggered for {label} (score={sc_val:.3f}) -> say: {text}")
+                # Liveness gate: require min consecutive hits AND liveness check (if enabled)
+                # ONLY greet the nearest person
+                is_live = hits >= args.min_live_frames and liveness_ok
+                if args.greet and is_live and is_nearest:
+                    if label != 'Unknown' and score is not None:
+                        try:
+                            sc_val = float(score)
+                        except Exception:
+                            sc_val = 0.0
+                        if sc_val >= args.greet_threshold:
+                            now = time.time()
+                            last = last_greet_time.get(label, 0.0)
+                            if now - last >= args.greet_interval:
+                                # non-blocking speak
                                 try:
-                                    # Try the absolute say path first (more deterministic on macOS)
-                                    SAY_BIN = '/usr/bin/say'
-                                    p = subprocess.Popen([SAY_BIN, text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                    print(f"Launched say pid={p.pid} via {SAY_BIN}")
-                                    last_greet_time[label] = now
-                                except Exception as e:
-                                    print(f"/usr/bin/say Popen failed: {e}")
-                                    # Try AppleScript as a fallback
+                                    # Expand abbreviations for better TTS pronunciation
+                                    spoken_label = label.replace("Dr.", "Doctor").replace("Mr.", "Mister").replace("Ms.", "Miss").replace("Mrs.", "Missus")
+                                    text = f"Hello {spoken_label}. Welcome."
+                                    print(f"Greeting triggered for {label} (score={sc_val:.3f}) -> say: {text}")
                                     try:
-                                        subprocess.run(['osascript', '-e', f'say "{text}"'], check=True)
-                                        print("Launched say via osascript")
+                                        SAY_BIN = '/usr/bin/say'
+                                        p = subprocess.Popen([SAY_BIN, text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        print(f"Launched say pid={p.pid} via {SAY_BIN}")
                                         last_greet_time[label] = now
-                                    except Exception as e2:
-                                        print(f"osascript failed: {e2}, falling back to os.system")
+                                    except Exception as e:
+                                        print(f"/usr/bin/say Popen failed: {e}")
                                         try:
-                                            os.system(f"say '{text}'")
+                                            subprocess.run(['osascript', '-e', f'say "{text}"'], check=True)
+                                            print("Launched say via osascript")
                                             last_greet_time[label] = now
-                                        except Exception as e3:
-                                            print(f"os.system say failed: {e3}")
+                                        except Exception as e2:
+                                            print(f"osascript failed: {e2}, falling back to os.system")
+                                            try:
+                                                os.system(f"say '{text}'")
+                                                last_greet_time[label] = now
+                                            except Exception as e3:
+                                                print(f"os.system say failed: {e3}")
+                                except Exception:
+                                    # ignore TTS failures
+                                    pass
+                    elif args.greet_unknown:
+                        now = time.time()
+                        last = last_greet_time.get(f"unknown_{tid}", 0.0)
+                        if now - last >= args.greet_interval:
+                            try:
+                                text = "Hello there. Welcome."
+                                SAY_BIN = '/usr/bin/say'
+                                p = subprocess.Popen([SAY_BIN, text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                last_greet_time[f"unknown_{tid}"] = now
                             except Exception:
-                                # ignore TTS failures
-                                pass
+                                try:
+                                    subprocess.run(['osascript', '-e', f'say "Hello there. Welcome."'], check=True)
+                                    last_greet_time[f"unknown_{tid}"] = now
+                                except Exception:
+                                    try:
+                                        os.system("say 'Hello there. Welcome.'")
+                                        last_greet_time[f"unknown_{tid}"] = now
+                                    except Exception:
+                                        pass
 
             # FPS
             elapsed = time.time() - started

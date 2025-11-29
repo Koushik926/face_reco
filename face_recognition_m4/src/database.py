@@ -51,7 +51,7 @@ def build_database(faces_dir: str, out_path: str, device=None) -> Dict:
                     print(f"    Resized to: {new_size}")
                 
                 img_cv = np.array(img)[:, :, ::-1].copy()  # PIL->OpenCV BGR
-                boxes, probs, face_batch = detector.detect(img_cv)
+                boxes, probs, face_batch, landmarks = detector.detect(img_cv)
                 
                 if boxes:
                     print(f"    Detected {len(boxes)} face(s) with confidence: {probs}")

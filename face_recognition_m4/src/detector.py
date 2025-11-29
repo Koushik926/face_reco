@@ -52,16 +52,17 @@ class FaceDetector:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         return Image.fromarray(rgb)
 
-    def detect(self, frame: np.ndarray) -> Tuple[List[np.ndarray], List[float], Optional[torch.Tensor]]:
+    def detect(self, frame: np.ndarray) -> Tuple[List[np.ndarray], List[float], Optional[torch.Tensor], Optional[List[np.ndarray]]]:
         """Detect faces in a BGR OpenCV frame.
 
         Returns:
             boxes: list of [x1, y1, x2, y2]
             probs: list of detection probabilities
             face_tensors: torch.Tensor of shape (N,3,H,W) on the detector device (or None)
+            landmarks: list of landmark arrays (Nx5x2) or None
         """
         if frame is None:
-            return [], [], None
+            return [], [], None, None
 
         pil = self._to_pil(frame)
 
@@ -108,39 +109,39 @@ class FaceDetector:
 
                 # Run a light .detect() on CPU and return boxes+probs (no face batch)
                 try:
-                    boxes, probs = self._cpu_mtcnn.detect(pil)
+                    boxes, probs, landmarks = self._cpu_mtcnn.detect(pil, landmarks=True)
                 except Exception:
-                    return [], [], None
+                    return [], [], None, None
                 if boxes is None:
-                    return [], [], None
-                return boxes.astype(int).tolist(), probs.tolist(), None
+                    return [], [], None, None
+                return boxes.astype(int).tolist(), probs.tolist(), None, (landmarks.tolist() if landmarks is not None else None)
             else:
                 # Other runtime error -> try detect to get boxes only
                 try:
-                    boxes, probs = self.mtcnn.detect(pil_for_mtcnn)
+                    boxes, probs, landmarks = self.mtcnn.detect(pil_for_mtcnn, landmarks=True)
                     if boxes is None:
-                        return [], [], None
+                        return [], [], None, None
                     # Remove padding offset if applicable
                     if isinstance(boxes, np.ndarray) and (pad_left or pad_top):
                         boxes = boxes - np.array([pad_left, pad_top, pad_left, pad_top])
-                    return boxes.astype(int).tolist(), probs.tolist(), None
+                    return boxes.astype(int).tolist(), probs.tolist(), None, (landmarks.tolist() if landmarks is not None else None)
                 except Exception:
-                    return [], [], None
+                    return [], [], None, None
         except Exception:
             # Generic fallback: run detect to get boxes and probs only
             try:
-                boxes, probs = self.mtcnn.detect(pil_for_mtcnn)
+                boxes, probs, landmarks = self.mtcnn.detect(pil_for_mtcnn, landmarks=True)
             except Exception:
-                return [], [], None
+                return [], [], None, None
             if boxes is None:
-                return [], [], None
+                return [], [], None, None
             if isinstance(boxes, np.ndarray) and (pad_left or pad_top):
                 boxes = boxes - np.array([pad_left, pad_top, pad_left, pad_top])
-            return boxes.astype(int).tolist(), probs.tolist(), None
+            return boxes.astype(int).tolist(), probs.tolist(), None, (landmarks.tolist() if landmarks is not None else None)
 
         # faces can be (PIL images or torch tensors, probs)
         if faces is None:
-            return [], [], None
+            return [], [], None, None
 
         # If return is tuple (faces, probs)
         if isinstance(faces, tuple) and len(faces) == 2:
@@ -152,7 +153,7 @@ class FaceDetector:
         # Normalize face_imgs into a list for uniform processing
         face_list = []
         if face_imgs is None:
-            return [], [], None
+            return [], [], None, None
         elif isinstance(face_imgs, torch.Tensor):
             # tensor can be (N,3,H,W) or (3,H,W)
             if face_imgs.dim() == 4:
@@ -169,7 +170,7 @@ class FaceDetector:
             face_list = []
 
         if not face_list:
-            return [], [], None
+            return [], [], None, None
 
         # face_list items may be PIL.Image.Image or torch.Tensor
         face_tensors = []
@@ -193,24 +194,28 @@ class FaceDetector:
                 continue
 
         if not face_tensors:
-            return [], [], None
+            return [], [], None, None
 
         face_batch = torch.stack(face_tensors, dim=0).to(self.device)
 
-        # To get boxes we can call detect on the PIL again
+        # To get boxes and landmarks we can call detect on the PIL again
         try:
-            boxes, det_probs = self.mtcnn.detect(pil_for_mtcnn)
+            boxes, det_probs, landmarks = self.mtcnn.detect(pil_for_mtcnn, landmarks=True)
             if boxes is None:
                 boxes = []
                 det_probs = []
+                landmarks = None
         except Exception:
             boxes = []
             det_probs = []
+            landmarks = None
 
-        # If we padded before running MTCNN, remove the padding offset from boxes
+        # If we padded before running MTCNN, remove the padding offset from boxes and landmarks
         if isinstance(boxes, np.ndarray) and (pad_left or pad_top):
             boxes = boxes - np.array([pad_left, pad_top, pad_left, pad_top])
+            if landmarks is not None:
+                landmarks = landmarks - np.array([pad_left, pad_top])
 
         boxes_int = boxes.astype(int).tolist() if len(boxes) else []
 
-        return boxes_int, det_probs.tolist() if len(det_probs) else probs, face_batch
+        return boxes_int, det_probs.tolist() if len(det_probs) else probs, face_batch, (landmarks.tolist() if landmarks is not None else None)

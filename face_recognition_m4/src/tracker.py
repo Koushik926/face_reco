@@ -34,14 +34,20 @@ class SimpleTracker:
     Keeps tracks as dict id -> {box, missed} and assigns integer IDs.
     """
 
-    def __init__(self, iou_threshold: float = 0.3, max_missed: int = 5, smoothing_alpha: float = 0.6):
+    def __init__(self, iou_threshold: float = 0.3, max_missed: int = 5, smoothing_alpha: float = 0.6, stable_k: int = 3, stable_min_score: float = 0.65):
         self.iou_threshold = iou_threshold
         self.max_missed = max_missed
         self.next_id = 1
-        # tracks: id -> {'box': box, 'smoothed': box, 'missed': 0, 'label': str, 'score': float}
+        # tracks: id -> {'box': box, 'smoothed': box, 'missed': 0, 'hits': 0, 'label': str, 'score': float,
+        #                 'history': deque([(label, score), ...]), 'stable_label': str, 'stable_score': float}
         self.tracks = {}
         # smoothing factor (alpha): new_smoothed = alpha*new + (1-alpha)*old
         self.smoothing_alpha = float(smoothing_alpha)
+        # stable label parameters
+        from collections import deque
+        self._deque_cls = deque
+        self.stable_k = int(stable_k)
+        self.stable_min_score = float(stable_min_score)
 
     def update(self, boxes: List[List[int]], labels: List[str] = None, scores: List[float] = None) -> Dict[int, List[int]]:
         """Update tracks with new detection boxes.
@@ -70,14 +76,50 @@ class SimpleTracker:
                 # store raw box and update smoothed box
                 self.tracks[tid]['box'] = new_box
                 self.tracks[tid]['missed'] = 0
+                # increment consecutive hits for liveness
+                self.tracks[tid]['hits'] = int(self.tracks[tid].get('hits', 0)) + 1
                 # compute EMA per coordinate
                 sm = [int(round(self.smoothing_alpha * nb + (1.0 - self.smoothing_alpha) * ob)) for nb, ob in zip(new_box, old_box)]
                 self.tracks[tid]['smoothed'] = sm
+                # update recognition history if provided
+                if labels is not None and best_j < len(labels):
+                    lab = labels[best_j]
+                    sc = None
+                    if scores is not None and best_j < len(scores):
+                        try:
+                            sc = float(scores[best_j])
+                        except Exception:
+                            sc = None
+                    hist = self.tracks[tid].get('history')
+                    if hist is not None:
+                        hist.append((lab, sc))
+                        # recompute stable label by majority vote over last stable_k frames with min score threshold
+                        if len(hist) >= self.stable_k:
+                            # count occurrences only for entries meeting score threshold (if score available)
+                            counts = {}
+                            avg_scores = {}
+                            n_scores = {}
+                            for (lb, scv) in list(hist)[-self.stable_k:]:
+                                if scv is None or scv >= self.stable_min_score:
+                                    counts[lb] = counts.get(lb, 0) + 1
+                                    if scv is not None:
+                                        avg_scores[lb] = avg_scores.get(lb, 0.0) + scv
+                                        n_scores[lb] = n_scores.get(lb, 0) + 1
+                            if counts:
+                                stable = max(counts.items(), key=lambda kv: kv[1])[0]
+                                # compute avg score for stable label if available
+                                if stable in avg_scores and stable in n_scores and n_scores[stable] > 0:
+                                    self.tracks[tid]['stable_score'] = avg_scores[stable] / n_scores[stable]
+                                else:
+                                    self.tracks[tid]['stable_score'] = None
+                                self.tracks[tid]['stable_label'] = stable
                 updated[tid] = sm
                 used.add(best_j)
             else:
                 # no match
                 self.tracks[tid]['missed'] += 1
+                # decay hits on miss
+                self.tracks[tid]['hits'] = max(0, int(self.tracks[tid].get('hits', 0)) - 1)
                 if self.tracks[tid]['missed'] > self.max_missed:
                     del self.tracks[tid]
 
@@ -88,7 +130,7 @@ class SimpleTracker:
             tid = self.next_id
             self.next_id += 1
             # initialize smoothed to the raw box
-            entry = {'box': b, 'smoothed': b, 'missed': 0}
+            entry = {'box': b, 'smoothed': b, 'missed': 0, 'hits': 1}
             if labels is not None and j < len(labels):
                 entry['label'] = labels[j]
             else:
@@ -97,6 +139,12 @@ class SimpleTracker:
                 entry['score'] = float(scores[j])
             else:
                 entry['score'] = None
+            # init history deque
+            entry['history'] = self._deque_cls(maxlen=max(5, self.stable_k))
+            entry['stable_label'] = entry['label']
+            entry['stable_score'] = entry['score']
+            if entry['label'] is not None:
+                entry['history'].append((entry['label'], entry['score']))
             self.tracks[tid] = entry
             updated[tid] = b
 
