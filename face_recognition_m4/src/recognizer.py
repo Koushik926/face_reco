@@ -29,13 +29,36 @@ class Recognizer:
         """
         self.db = db or {}
         self.threshold = threshold
+        
+        # Precompute normalized embeddings for faster matching
+        self.normalized_embeddings = {}
+        for pid, rec in self.db.items():
+            emb = rec['embedding'].astype(np.float32)
+            norm = np.linalg.norm(emb)
+            if norm > 0:
+                self.normalized_embeddings[pid] = emb / norm
+            else:
+                self.normalized_embeddings[pid] = emb
 
     def match(self, emb: np.ndarray) -> Tuple[str, float]:
         """Match a single embedding to the DB. Returns (label, score)."""
+        if emb is None or len(self.db) == 0:
+            return 'Unknown', 0.0
+        
+        # Normalize query embedding
+        emb = emb.astype(np.float32)
+        norm = np.linalg.norm(emb)
+        if norm == 0:
+            return 'Unknown', 0.0
+        emb_normalized = emb / norm
+        
         best_id = None
         best_score = -1.0
-        for pid, rec in self.db.items():
-            score = cosine_similarity(emb, rec['embedding'])
+        
+        # Use precomputed normalized embeddings for faster matching
+        for pid, normalized_emb in self.normalized_embeddings.items():
+            # Dot product of normalized vectors = cosine similarity
+            score = float(np.dot(emb_normalized, normalized_emb))
             if score > best_score:
                 best_score = score
                 best_id = pid

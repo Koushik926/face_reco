@@ -51,8 +51,8 @@ def main():
     parser.add_argument('--detect-every', type=int, default=3, help='Run MTCNN every N frames')
     parser.add_argument('--embedder', choices=['resnet', 'mobileface'], default='resnet', help='Embedding model to use')
     parser.add_argument('--pad-mult', type=int, default=64, help='Padding multiple used by detector when running on MPS (higher may avoid MPS adaptive pool errors)')
-    parser.add_argument('--smoothing-alpha', type=float, default=0.4, help='Tracker smoothing alpha (0..1) where lower=more stable')
-    parser.add_argument('--max-missed', type=int, default=18, help='Max frames to keep a track without detection (higher=less blinking)')
+    parser.add_argument('--smoothing-alpha', type=float, default=0.0, help='Tracker smoothing alpha (0..1) where lower=more stable')
+    parser.add_argument('--max-missed', type=int, default=10000, help='Max frames to keep a track without detection (higher=less blinking)')
     parser.add_argument('--log-csv', default=os.path.join(os.path.dirname(__file__), '..', 'recognitions.csv'))
     parser.add_argument('--greet', action='store_true', help='Enable TTS greeting for recognized people (macOS say)')
     parser.add_argument('--greet-unknown', action='store_true', help='Also greet unknown people with a generic message')
@@ -62,9 +62,9 @@ def main():
     parser.add_argument('--stable-k', type=int, default=3, help='Frames required to stabilize identity (majority vote)')
     parser.add_argument('--stable-min-score', type=float, default=0.65, help='Minimum score to count toward identity stabilization')
     parser.add_argument('--require-liveness', action='store_true', help='Enable landmark-based liveness detection (blink/motion) to prevent 2D photo spoofing')
-    parser.add_argument('--liveness-motion-threshold', type=float, default=25.0, help='Minimum motion variance for liveness (higher=stricter)')
-    parser.add_argument('--liveness-min-motion-frames', type=int, default=10, help='Minimum frames with motion required for liveness')
-    parser.add_argument('--liveness-texture-threshold', type=float, default=20.0, help='Minimum texture variance for liveness (screens/photos have lower values)')
+    parser.add_argument('--liveness-motion-threshold', type=float, default=5.0, help='Minimum motion variance for liveness (higher=stricter)')
+    parser.add_argument('--liveness-min-motion-frames', type=int, default=3, help='Minimum frames with motion required for liveness')
+    parser.add_argument('--liveness-texture-threshold', type=float, default=10.0, help='Minimum texture variance for liveness (screens/photos have lower values)')
     parser.add_argument('--debug-liveness', action='store_true', help='Print liveness detection values for debugging')
     args = parser.parse_args()
 
@@ -142,6 +142,28 @@ def main():
                             crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
                             resized = cv2.resize(crop_rgb, (IMG_SIZE, IMG_SIZE))
                             arr = resized.astype('float32') / 255.0
+                            best_idx = -1
+                            for idx, (b, lab, sc) in enumerate(zip(boxes_out, labels, scores)):
+                                v = iou(box, b)
+                                if v > best_iou:
+                                    best_iou = v
+                                    best_idx = idx
+                            if best_idx >= 0 and best_iou >= 0.2:
+                                label = labels[best_idx]
+                                score = scores[best_idx]
+                                # store back into tracker
+                                tr['label'] = label
+                                tr['score'] = score
+                                # also push to history for stabilization
+                                hist = tr.get('history')
+                                if hist is not None:
+                                    try:
+                                        scv = float(score) if score is not None else None
+                                    except Exception:
+                                        scv = None
+                                    hist.append((label, scv))
+                        # Only process if crop_rgb and resized are valid
+                        if resized is not None:
                             t = torch.from_numpy(arr).permute(2, 0, 1)
                             t = (t - 0.5) / 0.5
                             face_tensors.append(t)
@@ -178,28 +200,22 @@ def main():
                 return max(0, (b[2] - b[0])) * max(0, (b[3] - b[1]))
             sorted_tracked = sorted(tracked.items(), key=lambda kv: area(kv[1]), reverse=True)
 
-            # Draw tracked boxes
-            for idx_sort, (tid, box) in enumerate(sorted_tracked):
-                # prefer track's last-known label (set in tracker.update); fallback to IoU matching
-                tr = tracker.tracks.get(tid, {})
-                # use stabilized identity if available
-                label = tr.get('stable_label', tr.get('label', 'Unknown'))
-                score = tr.get('stable_score', tr.get('score', None))
-                hits = int(tr.get('hits', 0))
-                
-                # Only the nearest person (idx_sort == 0) gets greeted
-                is_nearest = (idx_sort == 0)
-                
-                # Liveness check if enabled
-                liveness_ok = True
-                if liveness_detector is not None:
-                    # Find matching landmark for this track
+            # Draw tracked boxes only if there are tracked faces
+            if sorted_tracked:
+                # Compute attention score for each track
+                attention_scores = {}
+                for idx_sort, (tid, box) in enumerate(sorted_tracked):
+                    tr = tracker.tracks.get(tid, {})
+                    label = tr.get('stable_label', tr.get('label', 'Unknown'))
+                    score = tr.get('stable_score', tr.get('score', None))
+                    hits = int(tr.get('hits', 0))
+                    # Liveness check if enabled
+                    liveness_ok = True
                     lm_for_track = None
                     face_region = None
                     for i, (b, lm) in enumerate(zip(boxes_out, landmarks_out)):
                         if iou(box, b) > 0.3:
                             lm_for_track = lm
-                            # Extract face region for texture analysis
                             x1, y1, x2, y2 = [int(c) for c in box]
                             x1 = max(0, x1)
                             y1 = max(0, y1)
@@ -208,62 +224,105 @@ def main():
                             if x2 > x1 and y2 > y1:
                                 face_region = frame[y1:y2, x1:x2]
                             break
-                    if lm_for_track is not None:
+                    if liveness_detector is not None and lm_for_track is not None:
                         liveness_result = liveness_detector.update(tid, lm_for_track, box, face_region)
                         liveness_ok = liveness_result['is_live']
-                        # Debug logging
-                        if args.debug_liveness:
-                            print(f"[Liveness] {label}#{tid}: motion={liveness_result['motion_frames']}/{args.liveness_min_motion_frames}, "
-                                  f"texture={liveness_result.get('texture_variance', 0):.1f} (min={args.liveness_texture_threshold}), "
-                                  f"live={liveness_ok}")
+                    # --- Attention scoring ---
+                    # 1. Front-facing: use eye/nose/mouth landmarks
+                    facing_score = 0.0
+                    lip_score = 0.0
+                    if lm_for_track is not None and isinstance(lm_for_track, np.ndarray) and lm_for_track.shape[0] >= 5:
+                        # MTCNN: [left_eye, right_eye, nose, mouth_left, mouth_right]
+                        left_eye, right_eye, nose, mouth_left, mouth_right = lm_for_track[:5]
+                        # Front-facing: eyes horizontal, nose centered between eyes
+                        eye_dx = abs(left_eye[0] - right_eye[0])
+                        eye_dy = abs(left_eye[1] - right_eye[1])
+                        nose_x = nose[0]
+                        eye_center_x = (left_eye[0] + right_eye[0]) / 2.0
+                        nose_offset = abs(nose_x - eye_center_x)
+                        # Lower eye_dy and nose_offset = more front-facing
+                        facing_score = max(0.0, 1.0 - (eye_dy / (eye_dx + 1e-5)) - (nose_offset / (eye_dx + 1e-5)))
+                        # Lip movement: track mouth distance variance over last 10 frames
+                        mouth_dist = np.linalg.norm(mouth_left - mouth_right)
+                        if 'mouth_history' not in tr:
+                            tr['mouth_history'] = deque(maxlen=10)
+                        tr['mouth_history'].append(mouth_dist)
+                        if len(tr['mouth_history']) >= 5:
+                            lip_score = np.std(tr['mouth_history']) / (mouth_dist + 1e-5)
+                    # Combine scores: weight front-facing 2x, lip movement 1x
+                    attention_scores[tid] = 2.0 * facing_score + 1.0 * lip_score + (1.0 if liveness_ok else 0.0)
+                # Find track with highest attention score
+                best_tid = max(attention_scores, key=lambda k: attention_scores[k]) if attention_scores else None
+                # Draw and greet only the best_tid
+                for idx_sort, (tid, box) in enumerate(sorted_tracked):
+                    tr = tracker.tracks.get(tid, {})
+                    label = tr.get('stable_label', tr.get('label', 'Unknown'))
+                    score = tr.get('stable_score', tr.get('score', None))
+                    hits = int(tr.get('hits', 0))
+                    # Always use last known smoothed box for drawing
+                    smoothed_box = tr.get('smoothed', box)
+                    liveness_ok = True
+                    lm_for_track = None
+                    face_region = None
+                    for i, (b, lm) in enumerate(zip(boxes_out, landmarks_out)):
+                        if iou(smoothed_box, b) > 0.3:
+                            lm_for_track = lm
+                            x1, y1, x2, y2 = [int(c) for c in smoothed_box]
+                            x1 = max(0, x1)
+                            y1 = max(0, y1)
+                            x2 = min(frame.shape[1], x2)
+                            y2 = min(frame.shape[0], y2)
+                            if x2 > x1 and y2 > y1:
+                                face_region = frame[y1:y2, x1:x2]
+                            break
+                    if liveness_detector is not None and lm_for_track is not None:
+                        liveness_result = liveness_detector.update(tid, lm_for_track, smoothed_box, face_region)
+                        liveness_ok = liveness_result['is_live']
+                    # Draw box using smoothed_box
+                    # Blue box for high attention (front-facing + lip movement)
+                    facing_score = 0.0
+                    lip_score = 0.0
+                    if lm_for_track is not None and isinstance(lm_for_track, np.ndarray) and lm_for_track.shape[0] >= 5:
+                        left_eye, right_eye, nose, mouth_left, mouth_right = lm_for_track[:5]
+                        eye_dx = abs(left_eye[0] - right_eye[0])
+                        eye_dy = abs(left_eye[1] - right_eye[1])
+                        nose_x = nose[0]
+                        eye_center_x = (left_eye[0] + right_eye[0]) / 2.0
+                        nose_offset = abs(nose_x - eye_center_x)
+                        facing_score = max(0.0, 1.0 - (eye_dy / (eye_dx + 1e-5)) - (nose_offset / (eye_dx + 1e-5)))
+                        mouth_dist = np.linalg.norm(mouth_left - mouth_right)
+                        if 'mouth_history' not in tr:
+                            tr['mouth_history'] = deque(maxlen=10)
+                        tr['mouth_history'].append(mouth_dist)
+                        if len(tr['mouth_history']) >= 5:
+                            lip_score = np.std(tr['mouth_history']) / (mouth_dist + 1e-5)
+                    # Thresholds for blue box (tuned)
+                    if liveness_detector is not None and not liveness_ok:
+                        spoof_label = f"Spoof" if label == "Unknown" else f"{label} Spoof"
+                        draw_box_label(frame, smoothed_box, f"{spoof_label}#{tid}", score, color=(0,0,255))
+                    elif liveness_detector is not None and liveness_ok and facing_score > 0.4 and lip_score > 0.03:
+                        draw_box_label(frame, smoothed_box, f"{label}#{tid}", score, color=(255,0,0))
+                        print(f"[Attention] {label}#{tid}: facing_score={facing_score:.2f}, lip_score={lip_score:.2f} -> BLUE BOX")
+                    elif liveness_detector is not None and liveness_ok:
+                        draw_box_label(frame, smoothed_box, f"{label}#{tid}", score, color=(0,255,0))
                     else:
-                        liveness_ok = False  # no landmarks means no liveness confirmation
-                if label == 'Unknown' and boxes_out:
-                    # use IoU to find best matching detection and assign label
-                    best_iou = 0.0
-                    best_idx = -1
-                    for idx, (b, lab, sc) in enumerate(zip(boxes_out, labels, scores)):
-                        v = iou(box, b)
-                        if v > best_iou:
-                            best_iou = v
-                            best_idx = idx
-                    if best_idx >= 0 and best_iou >= 0.2:
-                        label = labels[best_idx]
-                        score = scores[best_idx]
-                        # store back into tracker
-                        tr['label'] = label
-                        tr['score'] = score
-                        # also push to history for stabilization
-                        hist = tr.get('history')
-                        if hist is not None:
+                        draw_box_label(frame, smoothed_box, f"{label}#{tid}", score)
+                    # Only greet/respond to the best_tid
+                    is_live = hits >= args.min_live_frames and liveness_ok
+                    if args.greet and is_live and tid == best_tid:
+                        if label != 'Unknown' and score is not None:
                             try:
-                                scv = float(score) if score is not None else None
+                                sc_val = float(score)
                             except Exception:
-                                scv = None
-                            hist.append((label, scv))
-                draw_box_label(frame, box, f"{label}#{tid}", score)
-
-                # TTS greeting (macOS `say`) — speak once per person per interval
-                # Liveness gate: require min consecutive hits AND liveness check (if enabled)
-                # ONLY greet the nearest person
-                is_live = hits >= args.min_live_frames and liveness_ok
-                if args.greet and is_live and is_nearest:
-                    if label != 'Unknown' and score is not None:
-                        try:
-                            sc_val = float(score)
-                        except Exception:
-                            sc_val = 0.0
-                        if sc_val >= args.greet_threshold:
-                            now = time.time()
-                            last = last_greet_time.get(label, 0.0)
-                            if now - last >= args.greet_interval:
-                                # non-blocking speak
-                                try:
-                                    # Expand abbreviations for better TTS pronunciation
-                                    spoken_label = label.replace("Dr.", "Doctor").replace("Mr.", "Mister").replace("Ms.", "Miss").replace("Mrs.", "Missus")
-                                    text = f"Hello {spoken_label}. Welcome."
-                                    print(f"Greeting triggered for {label} (score={sc_val:.3f}) -> say: {text}")
+                                sc_val = 0.0
+                            if sc_val >= args.greet_threshold:
+                                now = time.time()
+                                last = last_greet_time.get(label, 0.0)
+                                if now - last >= args.greet_interval:
                                     try:
+                                        spoken_label = label.replace("Dr.", "Doctor").replace("Mr.", "Mister").replace("Ms.", "Miss").replace("Mrs.", "Missus")
+                                        text = f"Hello {spoken_label}. Welcome."
+                                        print(f"Greeting triggered for {label} (score={sc_val:.3f}) -> say: {text}")
                                         SAY_BIN = '/usr/bin/say'
                                         p = subprocess.Popen([SAY_BIN, text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                                         print(f"Launched say pid={p.pid} via {SAY_BIN}")
@@ -281,28 +340,16 @@ def main():
                                                 last_greet_time[label] = now
                                             except Exception as e3:
                                                 print(f"os.system say failed: {e3}")
-                                except Exception:
-                                    # ignore TTS failures
-                                    pass
-                    elif args.greet_unknown:
-                        now = time.time()
-                        last = last_greet_time.get(f"unknown_{tid}", 0.0)
-                        if now - last >= args.greet_interval:
-                            try:
-                                text = "Hello there. Welcome."
-                                SAY_BIN = '/usr/bin/say'
-                                p = subprocess.Popen([SAY_BIN, text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                last_greet_time[f"unknown_{tid}"] = now
-                            except Exception:
+                        elif args.greet_unknown:
+                            now = time.time()
+                            last = last_greet_time.get(f"unknown_{tid}", 0.0)
+                            if now - last >= args.greet_interval:
                                 try:
-                                    subprocess.run(['osascript', '-e', f'say "Hello there. Welcome."'], check=True)
+                                    text = "Hello there. Welcome."
+                                    SAY_BIN = '/usr/bin/say'
+                                    p = subprocess.Popen([SAY_BIN, text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                                     last_greet_time[f"unknown_{tid}"] = now
-                                except Exception:
-                                    try:
-                                        os.system("say 'Hello there. Welcome.'")
-                                        last_greet_time[f"unknown_{tid}"] = now
-                                    except Exception:
-                                        pass
+                                except Exception: pass
 
             # FPS
             elapsed = time.time() - started
