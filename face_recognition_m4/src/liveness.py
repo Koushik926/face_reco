@@ -33,7 +33,7 @@ def eye_aspect_ratio(eye_landmarks):
 class LivenessDetector:
     """Detect live faces via blink detection and motion analysis."""
     
-    def __init__(self, ear_threshold=0.21, blink_consec_frames=2, history_size=30, motion_threshold=15.0, min_blinks=1, min_motion_frames=8, texture_threshold=25.0):
+    def __init__(self, ear_threshold=0.21, blink_consec_frames=2, history_size=30, motion_threshold=25.0, min_blinks=1, min_motion_frames=12, texture_threshold=35.0):
         """
         Args:
             ear_threshold: EAR below this is considered closed eye
@@ -53,7 +53,7 @@ class LivenessDetector:
         self.texture_threshold = texture_threshold
         
         # Track state per track_id
-        self.track_state = {}  # tid -> {'ear_history': deque, 'blink_count': int, 'closed_frames': int, 'positions': deque, 'motion_frames': int}
+        self.track_state = {}  # tid -> {'ear_history': deque, 'blink_count': int, 'closed_frames': int, 'positions': deque, 'motion_frames': int, 'liveness_history': deque}
     
     def update(self, track_id, landmarks, box, face_region=None):
         """Update liveness state for a track.
@@ -74,7 +74,8 @@ class LivenessDetector:
                 'closed_frames': 0,
                 'positions': deque(maxlen=10),
                 'motion_frames': 0,
-                'last_variance': 0.0
+                'last_variance': 0.0,
+                'liveness_history': deque(maxlen=5)  # Track last 5 liveness results for stability
             }
         
         state = self.track_state[track_id]
@@ -142,8 +143,18 @@ class LivenessDetector:
         # Only consider live if BOTH motion and texture conditions met
         is_live = has_sufficient_motion and has_texture
         
+        # Stabilize liveness result using majority vote over last 5 frames
+        state['liveness_history'].append(is_live)
+        if len(state['liveness_history']) >= 3:
+            # Majority vote: if at least 3 out of last 5 frames say live, then live
+            live_count = sum(state['liveness_history'])
+            stable_is_live = live_count >= (len(state['liveness_history']) // 2 + 1)
+        else:
+            # Not enough history yet, use current result
+            stable_is_live = is_live
+        
         return {
-            'is_live': is_live,
+            'is_live': stable_is_live,
             'blink_count': state['blink_count'],
             'has_motion': has_motion,
             'motion_frames': state['motion_frames'],

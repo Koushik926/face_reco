@@ -78,8 +78,8 @@ class SimpleTracker:
                 self.tracks[tid]['missed'] = 0
                 # increment consecutive hits for liveness
                 self.tracks[tid]['hits'] = int(self.tracks[tid].get('hits', 0)) + 1
-                # compute EMA per coordinate
-                sm = [int(round(self.smoothing_alpha * nb + (1.0 - self.smoothing_alpha) * ob)) for nb, ob in zip(new_box, old_box)]
+                # ultra-stable: use average of old and new box (no EMA)
+                sm = [int(round((nb + ob) / 2.0)) for nb, ob in zip(new_box, old_box)]
                 self.tracks[tid]['smoothed'] = sm
                 # update recognition history if provided
                 if labels is not None and best_j < len(labels):
@@ -120,8 +120,7 @@ class SimpleTracker:
                 self.tracks[tid]['missed'] += 1
                 # decay hits on miss
                 self.tracks[tid]['hits'] = max(0, int(self.tracks[tid].get('hits', 0)) - 1)
-                if self.tracks[tid]['missed'] > self.max_missed:
-                    del self.tracks[tid]
+                # Do not delete tracks; keep last known box for maximum persistence
 
         # Create tracks for unmatched boxes
         for j, b in enumerate(boxes):
